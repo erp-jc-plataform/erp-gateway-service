@@ -9,11 +9,20 @@ import compression from 'compression'
 import { createProxyMiddleware } from 'http-proxy-middleware'
 import dotenv from 'dotenv'
 
+import swaggerUi from 'swagger-ui-express'
+import { ApolloServer } from '@apollo/server'
+import { expressMiddleware } from '@apollo/server/express4'
+import { makeExecutableSchema } from '@graphql-tools/schema'
+
 import { authMiddleware } from './middleware/auth.middleware'
 import { requireModule } from './middleware/license.middleware'
 import { requestLogger, errorLogger, moduleAccessLogger } from './middleware/logger.middleware'
 import { routes } from './config/routes.config'
 import { checkAllServices } from './utils/health.util'
+import { swaggerSpec } from './config/swagger.config'
+import { typeDefs } from './graphql/schema'
+import { resolvers } from './graphql/resolvers'
+import { buildContext } from './graphql/context'
 
 // Cargar variables de entorno
 dotenv.config()
@@ -25,8 +34,11 @@ const PORT = process.env.PORT || 4000
 // MIDDLEWARE GLOBAL
 // ==========================================
 
-// Seguridad
-app.use(helmet())
+// Seguridad (CSP relajado en dev para Apollo Sandbox)
+app.use(helmet({
+  contentSecurityPolicy: process.env.NODE_ENV === 'production' ? undefined : false,
+  crossOriginEmbedderPolicy: process.env.NODE_ENV === 'production' ? undefined : false,
+}))
 
 // Compresión
 app.use(compression())
@@ -100,13 +112,46 @@ app.get('/health', async (req, res) => {
   }
 })
 
+// ==========================================
+// SWAGGER DOCS
+// ==========================================
+
+app.get('/docs/swagger.json', (_req, res) => {
+  res.setHeader('Content-Type', 'application/json')
+  res.send(swaggerSpec)
+})
+
+app.use(
+  '/docs',
+  swaggerUi.serve,
+  swaggerUi.setup(swaggerSpec, {
+    customSiteTitle: 'Business ERP — API Gateway',
+    customCss: `
+      .swagger-ui .topbar { background-color: #1a1a2e; }
+      .swagger-ui .topbar .download-url-wrapper { display: none; }
+      .swagger-ui .info .title { color: #1a1a2e; }
+    `,
+    swaggerOptions: {
+      persistAuthorization: true,
+      displayRequestDuration: true,
+      filter: true,
+      tagsSorter: 'alpha',
+    },
+  })
+)
+
 // Info del gateway
-app.get('/info', (req, res) => {
+app.get('/info', (_req, res) => {
   res.json({
     name: 'Business Gateway',
     version: '1.0.0',
     description: 'API Gateway para Business ERP',
     environment: process.env.NODE_ENV,
+    docs: {
+      swagger: `/docs`,
+      graphql: `/graphql`,
+      swaggerJson: `/docs/swagger.json`,
+    },
     routes: routes.map(r => ({
       path: r.path,
       requireAuth: r.requireAuth,
@@ -152,20 +197,25 @@ routes.forEach(route => {
   const proxy = createProxyMiddleware({
     target: route.target,
     changeOrigin: true,
-    pathRewrite: (path, req) => {
-      // Remover el prefijo del path para el servicio destino
-      return path.replace(route.path, '')
-    },
     onProxyReq: (proxyReq, req: any) => {
+      // Re-escribir el body parseado por express.json() al stream del proxy
+      // (express.json consume el stream original, hay que re-enviarlo)
+      if (req.body && Object.keys(req.body).length > 0) {
+        const bodyData = JSON.stringify(req.body)
+        proxyReq.setHeader('Content-Type', 'application/json')
+        proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyData))
+        proxyReq.write(bodyData)
+      }
+
       // Pasar información del usuario al microservicio
       if (req.user) {
         proxyReq.setHeader('X-User-Id', String(req.user.usuario_id))
         proxyReq.setHeader('X-Usuario', req.user.usuario)
-        
+
         if (req.user.cliente_id) {
           proxyReq.setHeader('X-Cliente-Id', String(req.user.cliente_id))
         }
-        
+
         if (req.user.perfil_id) {
           proxyReq.setHeader('X-Perfil-Id', String(req.user.perfil_id))
         }
@@ -176,7 +226,6 @@ routes.forEach(route => {
         proxyReq.setHeader('X-Module', req.licencia.moduloCodigo)
       }
 
-      // Log de la petición proxeada
       console.log(`[PROXY] ${req.method} ${route.path} → ${route.target}`)
     },
     onProxyRes: (proxyRes, req, res) => {
@@ -207,72 +256,98 @@ routes.forEach(route => {
   console.log(`  ${authBadge} ${route.path.padEnd(30)} → ${route.target} ${moduleBadge}`)
 })
 
-console.log('\n✅ Rutas configuradas\n')
+console.log('\n✅ Rutas REST configuradas\n')
 
 // ==========================================
-// MANEJO DE ERRORES GLOBAL
+// GRAPHQL + ARRANQUE DEL SERVIDOR
 // ==========================================
 
-// 404 - Not Found
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Ruta no encontrada',
-    path: req.path,
-    message: 'La ruta solicitada no existe en este gateway',
-    availableRoutes: routes.map(r => r.path)
-  })
-})
+async function startServer() {
+  const schema = makeExecutableSchema({ typeDefs, resolvers })
+  const apolloServer = new ApolloServer({ schema })
 
-// Logger de errores
-app.use(errorLogger)
+  await apolloServer.start()
 
-// Error handler global
-app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
-  const statusCode = err.statusCode || 500
-  
-  res.status(statusCode).json({
-    error: err.message || 'Error interno del servidor',
-    timestamp: new Date().toISOString(),
-    path: req.path,
-    method: req.method,
-    ...(process.env.NODE_ENV === 'development' && {
-      stack: err.stack,
-      details: err
+  // Endpoint GraphQL — reutiliza authMiddleware existente
+  app.use(
+    '/graphql',
+    authMiddleware,
+    expressMiddleware(apolloServer, { context: buildContext })
+  )
+
+  console.log('🔷 GraphQL listo\n')
+
+  // ==========================================
+  // MANEJO DE ERRORES GLOBAL
+  // ==========================================
+
+  // 404 - Not Found
+  app.use((req, res) => {
+    res.status(404).json({
+      error: 'Ruta no encontrada',
+      path: req.path,
+      message: 'La ruta solicitada no existe en este gateway',
+      availableRoutes: routes.map(r => r.path)
     })
   })
-})
 
-// ==========================================
-// INICIAR SERVIDOR
-// ==========================================
+  // Logger de errores
+  app.use(errorLogger)
 
-const server = app.listen(PORT, () => {
-  console.log('\n' + '='.repeat(60))
-  console.log('🚀 Business Gateway')
-  console.log('='.repeat(60))
-  console.log(`📍 URL:        http://localhost:${PORT}`)
-  console.log(`📚 Health:     http://localhost:${PORT}/health`)
-  console.log(`ℹ️  Info:       http://localhost:${PORT}/info`)
-  console.log(`🌍 Entorno:    ${process.env.NODE_ENV || 'development'}`)
-  console.log(`🔒 CORS:       ${process.env.ALLOWED_ORIGINS || '*'}`)
-  console.log('='.repeat(60) + '\n')
-})
-
-// Manejo de cierre graceful
-process.on('SIGTERM', () => {
-  console.log('\n⏹️  Cerrando servidor...')
-  server.close(() => {
-    console.log('✅ Servidor cerrado correctamente')
-    process.exit(0)
+  // Error handler global
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const statusCode = err.statusCode || 500
+    res.status(statusCode).json({
+      error: err.message || 'Error interno del servidor',
+      timestamp: new Date().toISOString(),
+      path: req.path,
+      method: req.method,
+      ...(process.env.NODE_ENV === 'development' && {
+        stack: err.stack,
+        details: err
+      })
+    })
   })
-})
 
-process.on('SIGINT', () => {
-  console.log('\n⏹️  Cerrando servidor...')
-  server.close(() => {
-    console.log('✅ Servidor cerrado correctamente')
-    process.exit(0)
+  // ==========================================
+  // INICIAR SERVIDOR
+  // ==========================================
+
+  const server = app.listen(PORT, () => {
+    console.log('\n' + '='.repeat(60))
+    console.log('🚀 Business Gateway')
+    console.log('='.repeat(60))
+    console.log(`📍 REST:       http://localhost:${PORT}/api/*`)
+    console.log(`🔷 GraphQL:    http://localhost:${PORT}/graphql`)
+    console.log(`� Swagger:    http://localhost:${PORT}/docs`)
+    console.log(`�📚 Health:     http://localhost:${PORT}/health`)
+    console.log(`ℹ️  Info:       http://localhost:${PORT}/info`)
+    console.log(`🌍 Entorno:    ${process.env.NODE_ENV || 'development'}`)
+    console.log(`🔒 CORS:       ${process.env.ALLOWED_ORIGINS || '*'}`)
+    console.log('='.repeat(60) + '\n')
   })
+
+  // Manejo de cierre graceful
+  process.on('SIGTERM', () => {
+    console.log('\n⏹️  Cerrando servidor...')
+    server.close(() => {
+      console.log('✅ Servidor cerrado correctamente')
+      process.exit(0)
+    })
+  })
+
+  process.on('SIGINT', () => {
+    console.log('\n⏹️  Cerrando servidor...')
+    server.close(() => {
+      console.log('✅ Servidor cerrado correctamente')
+      process.exit(0)
+    })
+  })
+}
+
+startServer().catch(err => {
+  console.error('❌ Error iniciando el servidor:', err)
+  process.exit(1)
 })
 
 export default app
