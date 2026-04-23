@@ -8,7 +8,7 @@ export interface GraphQLContext {
   clienteId: number | null
 }
 
-export function buildContext({ req }: { req: Request }): GraphQLContext {
+export async function buildContext({ req }: { req: Request }): Promise<GraphQLContext> {
   const token = req.headers.authorization?.replace('Bearer ', '') || null
   return {
     user: req.user || null,
